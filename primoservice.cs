@@ -28,32 +28,51 @@ public class PrimoService : IPrimoService
         _logger = logger;
         _memoryCache = memoryCache;
 
-        // Read the setting
         var baseUrl = _configuration["Primo:PrimoNewUi"];
         if (string.IsNullOrEmpty(baseUrl))
         {
+            _logger.LogCritical("BaseAddress is missing from configuration.");
             throw new Exception("BaseAddress is missing from configuration.");
         }
+
         _httpClient.BaseAddress = new Uri(baseUrl);
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-
     }
 
     public async Task<string> GetPrimoJWT()
     {
+        _logger.LogDebug("Attempting to retrieve Primo JWT from cache.");
+
         if (!_memoryCache.TryGetValue("PrimoJWT", out string jwt) || string.IsNullOrEmpty(jwt))
         {
+            _logger.LogInformation("Primo JWT not found in cache. Requesting new token.");
+
             jwt = await GetPrimoAuthToken();
 
-            var tokenHandler = new JwtSecurityTokenHandler();
-            var jwtToken = tokenHandler.ReadToken(jwt) as JwtSecurityToken;
-            DateTimeOffset expiration = jwtToken.ValidTo;
+            if (string.IsNullOrEmpty(jwt))
+            {
+                _logger.LogWarning("Failed to retrieve Primo JWT.");
+                return null;
+            }
 
-            var cacheOptions = new MemoryCacheEntryOptions()
-                .SetAbsoluteExpiration(expiration);
+            try
+            {
+                var jwtToken = new JwtSecurityTokenHandler().ReadToken(jwt) as JwtSecurityToken;
+                var expiration = jwtToken.ValidTo;
 
-            _memoryCache.Set("PrimoJWT", jwt, cacheOptions);
+                _memoryCache.Set("PrimoJWT", jwt, new MemoryCacheEntryOptions
+                {
+                    AbsoluteExpiration = expiration
+                });
+
+                _logger.LogDebug("Primo JWT cached until {Expiration}.", expiration);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to parse JWT expiration.");
+            }
         }
+
         return jwt;
     }
 
@@ -61,109 +80,115 @@ public class PrimoService : IPrimoService
     {
         try
         {
-            var url = string.Format(_configuration["Primo:PrimoNewUi"] + _configuration["PrimoUi:authRestUrl"], _configuration["PrimoUi:authInst"], _configuration["PrimoUi:authVid"]);
+            var url = string.Format(
+                _configuration["Primo:PrimoNewUi"] + _configuration["PrimoUi:authRestUrl"],
+                _configuration["PrimoUi:authInst"],
+                _configuration["PrimoUi:authVid"]
+            );
 
-            var response = await _apiClient.SendAsync<string>(
-               HttpMethod.Get,
-               url,
-               deserializeResponse: true,
-               isXmlResponse: false // Assuming JSON response, change if needed
-           );
+            _logger.LogDebug("Requesting Primo auth token from URL: {Url}", url);
 
-            return response;
+            return await _apiClient.SendAsync<string>(
+                HttpMethod.Get,
+                url,
+                deserializeResponse: true,
+                isXmlResponse: false
+            );
         }
-        catch (Exception e)
+        catch (Exception ex)
         {
-            _logger.LogError("Error in GetPrimoAuthToken " + e.Message);
+            _logger.LogError(ex, "Exception occurred while getting Primo auth token.");
+            return null;
         }
-        return null;
     }
-
 
     public async Task<string> GetSearchResultsFromPrimo(string query)
     {
         try
         {
+            _logger.LogInformation("Searching Primo with query: {Query}", query);
             query = query.Replace("[", "%5B").Replace("]", "%5D");
 
-            HttpResponseMessage response = await _httpClient.GetAsync(_configuration["PrimoUi:briefSearch"] + "?" + query);
+            var url = _configuration["PrimoUi:briefSearch"] + "?" + query;
+            var response = await _httpClient.GetAsync(url);
             response.EnsureSuccessStatusCode();
 
+            _logger.LogDebug("Search successful.");
             return await response.Content.ReadAsStringAsync();
         }
         catch (Exception ex)
         {
-            _logger.LogError("error in GetSearchResultsFromPrimo " + ex.Message + ex.StackTrace);
+            _logger.LogError(ex, "Error in GetSearchResultsFromPrimo.");
             return null;
         }
     }
 
-    public string GetPrimoQuery(string docId, string AlmaScope = "", string vid = "")
+    public string GetPrimoQuery(string docId, string almaScope = "", string vid = "")
     {
         if (string.IsNullOrEmpty(docId))
         {
+            _logger.LogWarning("GetPrimoQuery was called with null or empty docId.");
             throw new ArgumentException("Document ID cannot be null or empty", nameof(docId));
         }
+
         try
         {
             string url;
-            bool isManuscriptDigitalItem = vid == "MANUSCRIPTS" && docId.Contains("-");
             var serverUrl = _configuration["Primo:PrimoNewUi"];
+            bool isDigitalItem = vid == "MANUSCRIPTS" && docId.Contains("-");
 
-            if (!string.IsNullOrEmpty(AlmaScope))
+            if (!string.IsNullOrEmpty(almaScope))
             {
-                if (vid != "KTIV")
-                    url = string.Format(
-                        serverUrl + (!isManuscriptDigitalItem ? _configuration["PrimoUi:briefSearchAlma"] : _configuration["PrimoUi:briefSearchDigitalItem"]),
-                        docId, AlmaScope, vid
-                    );
-                else
-                    url = string.Format(
-                        serverUrl + _configuration["PrimoUi:ktivReDB"], docId.Replace("PNX_MANUSCRIPTS", ""),
-                        AlmaScope, vid
-                    );
+                url = vid != "KTIV"
+                    ? string.Format(serverUrl + (isDigitalItem ? _configuration["PrimoUi:briefSearchDigitalItem"] : _configuration["PrimoUi:briefSearchAlma"]), docId, almaScope, vid)
+                    : string.Format(serverUrl + _configuration["PrimoUi:ktivReDB"], docId.Replace("PNX_MANUSCRIPTS", ""), almaScope, vid);
             }
             else
             {
                 string pnxRestUrl = _configuration["PrimoUi:PnxRestUrl"];
                 if (!pnxRestUrl.Contains("{0}"))
-                {
-                    throw new InvalidOperationException("PrimoUi.PnxRestUrl is not properly formatted. It must contain '{0}' for docId.");
-                }
+                    throw new InvalidOperationException("PrimoUi.PnxRestUrl must contain '{0}' for docId.");
 
                 url = string.Format(serverUrl + pnxRestUrl, docId);
             }
+
+            _logger.LogDebug("Generated Primo URL: {Url}", url);
             return url;
         }
         catch (Exception ex)
         {
-            _logger.LogError("Error in GetPrimoQuery " + ex.Message + ex.StackTrace);
-            return "";
+            _logger.LogError(ex, "Failed to build Primo query URL.");
+            return string.Empty;
         }
     }
 
     public async Task<JToken> GetCachedPNXAsync(string docId, string vid, string lang)
     {
         if (string.IsNullOrEmpty(docId))
+        {
+            _logger.LogWarning("GetCachedPNXAsync called with empty docId.");
             return null;
+        }
 
         var cacheKey = $"{docId}_{vid}_{lang}";
 
         if (!_memoryCache.TryGetValue(cacheKey, out JToken cachedPNX))
         {
-            // Await the GetPNX call
-            string responseContent = await GetPNX(docId);
+            _logger.LogInformation("PNX not found in cache for key: {CacheKey}", cacheKey);
+
+            var responseContent = await GetPNX(docId, "", vid);
 
             if (!string.IsNullOrEmpty(responseContent))
             {
                 try
                 {
-                    cachedPNX = JToken.Parse(responseContent);//.SelectToken("pnx");
+                    cachedPNX = JToken.Parse(responseContent);
                     _memoryCache.Set(cacheKey, cachedPNX, TimeSpan.FromDays(1));
+                    _logger.LogDebug("Cached new PNX for {CacheKey}", cacheKey);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError($"JSON Parsing Error for docId {docId}: {ex.Message}");
+                    _logger.LogError(ex, "Failed to parse PNX response.");
                     return null;
                 }
             }
@@ -172,37 +197,38 @@ public class PrimoService : IPrimoService
         return cachedPNX;
     }
 
-
-    public async Task<string> GetPNX(string docId, string AlmaScope = "", string vid = "")
+    public async Task<string> GetPNX(string docId, string almaScope = "", string vid = "")
     {
         if (string.IsNullOrEmpty(docId))
         {
+            _logger.LogWarning("GetPNX called with empty docId.");
             throw new ArgumentException("Document ID cannot be null or empty", nameof(docId));
         }
 
         try
         {
-            string url = GetPrimoQuery(docId, AlmaScope, vid);
+            var url = GetPrimoQuery(docId, almaScope, vid);
+            var token = await GetPrimoJWT();
 
-            string token = await GetPrimoJWT();  // Await async token retrieval
-                                                 // Make the API request
-            var headers = new Dictionary<string, string>
-                {
-                    { "authorization", "Bearer " + token }
-                };
+            if (string.IsNullOrEmpty(token))
+            {
+                _logger.LogWarning("Unable to get JWT token for PNX request.");
+                return null;
+            }
+
+            var headers = new Dictionary<string, string> { { "authorization", $"Bearer {token}" } };
 
             var response = await _apiClient.SendAsync<string>(
                 HttpMethod.Get,
                 url,
-                headers: headers, // Passing headers
+                headers: headers,
                 deserializeResponse: false,
-                isXmlResponse: false // Assuming JSON response, change if needed
+                isXmlResponse: false
             );
-
 
             if (string.IsNullOrEmpty(response))
             {
-                _logger.LogWarning($"Empty response from PNX API for docId: {docId}");
+                _logger.LogWarning("Empty PNX response for docId: {DocId}", docId);
                 return null;
             }
 
@@ -210,60 +236,70 @@ public class PrimoService : IPrimoService
         }
         catch (Exception ex)
         {
-            _logger.LogError($"Error in GetPNX for docId {docId}: {ex.Message}");
+            _logger.LogError(ex, "Error retrieving PNX for docId: {DocId}", docId);
             throw;
         }
     }
-    a
+
     public JToken GetConfiguration(string vid)
     {
-        JToken configuration = null;
         try
         {
             var configurationUrl = _configuration["Primo:PrimoNewUi"] + _configuration["PrimoUi:viewRestConfigUrl"] + vid;
+
+            _logger.LogDebug("Fetching configuration from: {Url}", configurationUrl);
 
             var response = _apiClient.SendAsync<string>(
                 HttpMethod.Get,
                 configurationUrl,
                 deserializeResponse: true,
-                isXmlResponse: false // Assuming JSON response, change if needed
+                isXmlResponse: false
             );
-            configuration = JToken.Parse(response.ToString());
+
+            return JToken.Parse(response.ToString());
         }
-        catch { }
-        return configuration;
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve configuration for vid: {Vid}", vid);
+            return null;
+        }
     }
 
     public async Task<JToken> GetTranslation(string vid, string lang)
     {
-        JToken translations = null;
         try
         {
-            var translationUrl = string.Format(_configuration["Primo:PrimoNewUi"] + _configuration["PrimoUi:viewRestTranslateUrl"], vid, GetPrimoLang(lang));
+            var translationUrl = string.Format(
+                _configuration["Primo:PrimoNewUi"] + _configuration["PrimoUi:viewRestTranslateUrl"],
+                vid,
+                GetPrimoLang(lang)
+            );
+
+            _logger.LogDebug("Fetching translations from: {Url}", translationUrl);
 
             var response = await _apiClient.SendAsync<string>(
                 HttpMethod.Get,
                 translationUrl,
                 deserializeResponse: false,
-                isXmlResponse: false // Assuming JSON response, change if needed
+                isXmlResponse: false
             );
 
-            translations = JToken.Parse(response.ToString());
+            return JToken.Parse(response.ToString());
         }
-        catch { }
-        return translations;
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get translation for vid: {Vid}, lang: {Lang}", vid, lang);
+            return null;
+        }
     }
 
     private string GetPrimoLang(string lang)
     {
-        switch (lang)
+        return lang switch
         {
-            case "en":
-                return "en_US";
-            case "ar":
-                return "ar_EG";
-            default:
-                return "iw_IL";
-        }
+            "en" => "en_US",
+            "ar" => "ar_EG",
+            _ => "iw_IL"
+        };
     }
 }
