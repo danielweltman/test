@@ -1,0 +1,30 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json.Linq;
+
+public class PrimoManager
+{
+    private readonly IConfiguration _configuration;
+    private readonly ILogger<PrimoManager> _logger;
+
+    public PrimoManager(IConfiguration configuration, ILogger<PrimoManager> logger)
+    {
+        _configuration = configuration;
+        _logger = logger;
+    }
+
+    public void ValidateQuery(ref string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            _logger.LogWarning("Query is null or empty. Initializing as empty.");
+            query = string.Empty;
+        }
+
+        var lowerQuery = query.ToLowerInvariant();
+
+        AppendIfMissing(ref query, lowerQuery, "vid=", "&vid=NLI");
+        AppendIfMissing(ref query, low
